@@ -6,8 +6,8 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      # 语料与自测报告可从宿主机直接查看；代码以镜像内副本为准
-      - ./data:/app/data
+      # 演示语料随镜像构建生成（镜像内副本为准），不再以宿主机空目录覆盖；
+      # 自测报告可从宿主机 reports/ 直接查看。
       - ./reports:/app/reports
     environment:
       - PYTHONUNBUFFERED=1
@@ -16,4 +16,5 @@ services:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')"]
       interval: 30s
       timeout: 5s
+      start_period: 10s
       retries: 3

@@ -180,6 +180,22 @@ th { color: var(--muted); font-weight: 600; background: #f8fafc; position: stick
 .failure h4 { margin: 0 0 8px; color: var(--red); }
 .failure ul { margin: 6px 0 0; padding-left: 20px; font-size: 13px; }
 .failure code { background: #fff; padding: 1px 6px; border-radius: 4px; }
+.verdict {
+  border-radius: 8px;
+  padding: 10px 14px;
+  font-weight: 700;
+  font-size: 13px;
+  margin: 4px 0 10px;
+}
+.verdict.proven { background: #fff; border: 1px solid #f3aca4; color: var(--red); }
+.verdict.inconclusive { background: #fff; border: 1px solid #f2dfa0; color: var(--amber); }
+.diag-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 12px;
+  margin-top: 10px;
+}
+.diag-grid .metric { background: #fff; }
 
 .satisfied-banner {
   background: var(--green-bg);

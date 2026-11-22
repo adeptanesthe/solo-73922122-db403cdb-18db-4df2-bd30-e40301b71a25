@@ -262,3 +262,190 @@ def test_too_many_locked_terms_rejected(corpus):
             query="quantum error correction", min_recall=0.5, max_fdr=0.5,
             locked_terms=["surface", "syndrome"], max_terms=1,
         ))
+
+
+# --------------------------------------------------------------------------- #
+# intermediate false-detection overflow must be repairable
+# --------------------------------------------------------------------------- #
+def _dilution_corpus():
+    """Baseline 'alpha'; *every* first expansion term starts over the cap.
+
+    baseline alpha -> r1,r2                       (recall 2/6, fdr 0.00)
+    apoll          -> r1,r2,r3,r4 + n1,n2,n3      (recall 4/6, fdr 0.43)
+    bpoll          -> r1,r2,r5,r6 + n1,n2,n3      (recall 4/6, fdr 0.43)
+    apoll+bpoll    -> all docs                    (recall 1.0, fdr 0.33)
+
+    Under a 0.35 fdr cap neither term is acceptable alone, yet together they
+    reach full recall.  The old engine dropped both single-term branches and
+    reported a conflict; the fix must keep the over-limit states alive and
+    return the full-recall pair, both when one term is locked and when the
+    search is free to choose.
+    """
+    return Corpus.from_records([
+        {"id": "r1", "title": "t", "abstract": "alpha alpha", "relevant": True},
+        {"id": "r2", "title": "t", "abstract": "alpha alpha", "relevant": True},
+        {"id": "r3", "title": "t", "abstract": "apoll apoll", "relevant": True},
+        {"id": "r4", "title": "t", "abstract": "apoll apoll", "relevant": True},
+        {"id": "r5", "title": "t", "abstract": "bpoll bpoll", "relevant": True},
+        {"id": "r6", "title": "t", "abstract": "bpoll bpoll", "relevant": True},
+        {"id": "n1", "title": "t", "abstract": "apoll bpoll", "relevant": False},
+        {"id": "n2", "title": "t", "abstract": "apoll bpoll", "relevant": False},
+        {"id": "n3", "title": "t", "abstract": "apoll bpoll", "relevant": False},
+        {"id": "n4", "title": "t", "abstract": "filler filler", "relevant": False},
+        {"id": "n5", "title": "t", "abstract": "filler filler", "relevant": False},
+    ])
+
+
+def test_intermediate_fdr_overflow_is_diluted_and_satisfies():
+    corpus = _dilution_corpus()
+    res = analyze(corpus, AnalysisRequest(
+        query="alpha", min_recall=1.0, max_fdr=0.35,
+        locked_terms=["apoll"],
+    ))
+    assert res["status"] == "satisfied"
+    assert res["selected_terms"][0] == "apoll"  # locked term stays first
+    assert "bpoll" in res["selected_terms"]
+    assert res["metrics"]["recall"] == pytest.approx(1.0)
+    assert res["metrics"]["fdr"] <= 0.35 + 1e-12
+    # the trace must show the over-limit step and the recovery after it
+    fdr_by_term = {row["term"]: row["cumulative_fdr"] for row in res["trace"]}
+    assert fdr_by_term["apoll"] > 0.35
+    assert fdr_by_term["bpoll"] <= 0.35 + 1e-12
+
+
+def test_intermediate_fdr_overflow_without_lock():
+    corpus = _dilution_corpus()
+    res = analyze(corpus, AnalysisRequest(
+        query="alpha", min_recall=1.0, max_fdr=0.35,
+    ))
+    assert res["status"] == "satisfied"
+    assert res["metrics"]["recall"] == pytest.approx(1.0)
+    assert res["metrics"]["fdr"] <= 0.35 + 1e-12
+    # both expansion terms are needed; neither alone is within the cap
+    seed = corpus.docs_for_terms(corpus.query_terms("alpha"))
+    for term in res["expanded_terms"]:
+        m = corpus.metrics_for_docs(
+            seed | corpus.docs_for_terms([term])
+        )
+        assert m["fdr"] > 0.35
+
+
+def test_locked_polluting_term_can_be_repaired():
+    # The lock prefix alone is over the limit; a later relevant-heavy term
+    # dilutes it back under.  This must not be reported as a conflict.
+    corpus = _dilution_corpus()
+    res = analyze(corpus, AnalysisRequest(
+        query="alpha", min_recall=1.0, max_fdr=0.35,
+        locked_terms=["apoll"],
+    ))
+    assert res["status"] == "satisfied"
+    assert res["metrics"]["recall"] == pytest.approx(1.0)
+    assert res["metrics"]["fdr"] <= 0.35 + 1e-12
+    assert res["failure"] is None
+
+
+def test_beam_truncation_reports_inconclusive_not_impossible():
+    """Beam width 1 prunes the winning branch; that is not a proof."""
+    records = [
+        ("d0", "t2 t5", True), ("d1", "t5 t0 alpha", True),
+        ("d2", "t5 t0", True), ("d3", "t1 t4 t3", True),
+        ("d4", "t1 t3", True), ("d5", "t3 t5 alpha", True),
+        ("d6", "t5 t1 t0 alpha", False), ("d7", "t2 t4", False),
+        ("d8", "t3 t5", False), ("d9", "t0 t4 t1", False),
+        ("d10", "t4 t5", False), ("d11", "t4 t5", False),
+    ]
+    corpus = Corpus.from_records([
+        {"id": i, "title": "t", "abstract": a, "relevant": r}
+        for i, a, r in records
+    ])
+    kwargs = dict(query="alpha", min_recall=0.8, max_fdr=0.3, max_terms=2)
+    narrow = analyze(corpus, AnalysisRequest(beam_width=1, **kwargs))
+    wide = analyze(corpus, AnalysisRequest(beam_width=8, **kwargs))
+    assert wide["status"] == "satisfied"
+    assert narrow["status"] == "failed"
+    diag = narrow["failure"]
+    assert diag["verdict"] == "search_inconclusive"
+    assert diag["proven_infeasible"] is False
+    assert diag["branches_pruned"] is True
+    assert diag["recall_upper_bound"] >= 0.8
+    assert any("尚无定论" in r for r in diag["reasons"])
+
+
+def test_complete_search_proves_infeasibility():
+    corpus = _polluted_corpus()
+    res = analyze(corpus, AnalysisRequest(
+        query="quantum error correction", min_recall=1.0, max_fdr=0.1,
+        beam_width=32,
+    ))
+    assert res["status"] == "failed"
+    diag = res["failure"]
+    assert diag["verdict"] == "proven_infeasible"
+    assert diag["proven_infeasible"] is True
+    assert diag["search_complete"] is True
+    # the recall bound may still be 1.0 here (ignoring fdr full recall *is*
+    # reachable); the proof comes from the exhaustive search finding nothing
+    assert diag["recall_upper_bound"] <= 1.0
+    assert diag["best_feasible_recall"] < 1.0
+    # no satisfying combination exists, so any best-effort output stays
+    # below the recall floor and within the false-detection limits
+    if res["best_found"]:
+        assert res["best_found"]["metrics"]["recall"] < 1.0
+        assert res["best_found"]["metrics"]["fdr"] <= 0.1 + 1e-12
+
+
+def test_brute_force_matches_beam_search_on_random_corpora():
+    """Cross-check the beam search against exhaustive enumeration."""
+    import itertools
+    import random
+
+    from app.engine import extract_candidates
+
+    rng = random.Random(20261122)
+    for _trial in range(60):
+        n_terms = rng.randint(4, 6)
+        terms = [f"t{i}" for i in range(n_terms)]
+        docs, labels = [], []
+        for i in range(12):
+            docs.append(" ".join(rng.sample(terms, rng.randint(2, 3))))
+            labels.append(i < 6)
+        for idx in rng.sample(range(12), 3):
+            docs[idx] += " alpha"
+        corpus = Corpus.from_records([
+            {"id": f"d{i}", "title": "t", "abstract": a,
+             "relevant": labels[i]}
+            for i, a in enumerate(docs)
+        ])
+        base = corpus.query_terms("alpha")
+        if not base:
+            continue
+        cands = [c.term for c in extract_candidates(corpus, base, set())]
+        if len(cands) < 3:
+            continue
+        base_docs = corpus.docs_for_terms(base)
+        for max_terms in (2, 3):
+            for min_recall in (0.8, 1.0):
+                for max_fdr in (0.2, 0.3):
+                    best_feasible = None
+                    for k in range(max_terms + 1):
+                        for combo in itertools.combinations(cands, k):
+                            m = corpus.metrics_for_docs(
+                                base_docs | corpus.docs_for_terms(combo)
+                            )
+                            if (m["recall"] >= min_recall - 1e-12
+                                    and m["fdr"] <= max_fdr + 1e-12):
+                                if (best_feasible is None
+                                        or m["recall"] > best_feasible):
+                                    best_feasible = m["recall"]
+                    res = analyze(corpus, AnalysisRequest(
+                        query="alpha", min_recall=min_recall,
+                        max_fdr=max_fdr, max_terms=max_terms, beam_width=10,
+                    ))
+                    if best_feasible is None:
+                        assert res["status"] == "failed"
+                    else:
+                        assert res["status"] == "satisfied"
+                        # the search must reach the true optimum, not merely
+                        # some feasible state
+                        assert res["metrics"]["recall"] == pytest.approx(
+                            best_feasible
+                        )

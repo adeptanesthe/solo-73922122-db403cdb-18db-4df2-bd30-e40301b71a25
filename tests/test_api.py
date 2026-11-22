@@ -120,6 +120,31 @@ def test_invalid_threshold_400(session):
     assert resp.status_code == 422  # pydantic validation
 
 
+def test_failure_payload_exposes_bounds_and_best_found(session):
+    """Diagnosis always reports both a safe upper bound and the best found."""
+    sid = session["session_id"]
+    # 'neural' appears only in negative docs; locking it forces an
+    # over-limit lock prefix that no combination can repair at fdr<=0.
+    client.post("/api/revise", json={"session_id": sid, "lock": ["neural"]})
+    data = _analyze(sid, min_recall=0.9, max_fdr=0.0).json()
+    assert data["status"] == "failed"
+    f = data["failure"]
+    for key in (
+        "verdict", "proven_infeasible", "search_complete", "branches_pruned",
+        "recall_upper_bound", "global_recall_upper_bound",
+        "best_feasible_recall", "reasons",
+    ):
+        assert key in f, key
+    assert f["verdict"] in {"proven_infeasible", "search_inconclusive"}
+    assert 0.0 <= f["recall_upper_bound"] <= 1.0
+    # best-effort payload is present and within the false-detection limits
+    assert "best_found" in data
+    bf = data["best_found"]
+    if bf is not None:
+        assert bf["metrics"]["fdr"] <= 1e-12
+        assert bf["metrics"]["recall"] < 1.0
+
+
 # --------------------------------------------------------------------------- #
 # revisions & stale-suggestion invalidation
 # --------------------------------------------------------------------------- #

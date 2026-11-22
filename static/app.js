@@ -285,12 +285,26 @@ function renderResult(data) {
   const base = data.baseline_metrics;
   const fin = data.metrics;
   const satisfied = data.status === "satisfied";
+  const inconclusive = data.failure && data.failure.verdict === "search_inconclusive";
+  let banner;
+  if (satisfied) {
+    banner = `<div class="satisfied-banner">
+      ✅ 找到满足阈值的扩展方案：扩展词 ${data.expanded_terms.length} 个 →
+      ${data.expanded_terms.map(escapeHtml).join(", ") || "（无需扩展）"}
+    </div>`;
+  } else if (inconclusive) {
+    banner = `<div class="failed-banner">
+      ⚠ 本次搜索未找到达标组合，但束宽/候选词池截断了搜索，<strong>尚无定论</strong>；
+      详见下方诊断与召回上界。
+    </div>`;
+  } else {
+    banner = `<div class="failed-banner">
+      ❌ 已证实不存在同时满足召回下限与误检上限的扩展方案，原因见下方诊断。
+    </div>`;
+  }
+  const bf = data.best_found;
   summary.innerHTML = `
-    <div class="${satisfied ? "satisfied-banner" : "failed-banner"}">
-      ${satisfied
-        ? `✅ 找到满足阈值的扩展方案：扩展词 ${data.expanded_terms.length} 个 → ${data.expanded_terms.map(escapeHtml).join(", ") || "（无需扩展）"}`
-        : "❌ 找不到同时满足召回下限与误检上限的扩展方案，原因见下方诊断。"}
-    </div>
+    ${banner}
     <div class="metric-grid">
       ${metric("基线召回", fmtPct(base.recall), base.recall >= data.thresholds.min_recall ? "good" : "bad")}
       ${metric("扩展后召回", fmtPct(fin.recall), fin.recall >= data.thresholds.min_recall ? "good" : "bad")}
@@ -301,6 +315,12 @@ function renderResult(data) {
       ${metric("命中文档", `${fin.n_retrieved} / ${data.corpus_size}`)}
       ${metric("正例命中 (TP)", `${fin.true_positives} / ${data.n_relevant}`)}
       ${metric("误检 (FP)", `${fin.false_positives}`)}
+      ${bf && bf.metrics
+        ? metric("已找到且满足限制的最高召回", fmtPct(bf.metrics.recall))
+        : metric("已找到且满足限制的最高召回", "无")}
+      ${data.failure
+        ? metric("最高可达召回（上界）", fmtPct(data.failure.recall_upper_bound))
+        : ""}
     </div>
     <p class="hint">
       基线查询词：${data.baseline_terms.map(escapeHtml).join(", ") || "（词表中无匹配）"}
@@ -332,15 +352,46 @@ function renderResult(data) {
   if (data.failure) {
     box.classList.remove("hidden");
     const f = data.failure;
+    const inconclusive = f.verdict === "search_inconclusive";
+    const bf = data.best_found;
+    const verdictBanner = inconclusive
+      ? `<div class="verdict inconclusive">
+           ⚠ 搜索尚无定论：候选组合被束宽截断，仍可能存在达标组合。
+         </div>`
+      : `<div class="verdict proven">
+           ⛔ 已证实无法达标：搜索已穷尽，不存在同时满足词项与误检限制且达到召回下限的组合。
+         </div>`;
     box.innerHTML = `
       <h4>失败诊断</h4>
+      ${verdictBanner}
       <ul>${f.reasons.map((r) => `<li>${escapeHtml(r)}</li>`).join("")}</ul>
+      <div class="diag-grid">
+        <div class="metric">
+          <div class="k">最高可达召回（可靠上界）</div>
+          <div class="v">${fmtPct(f.recall_upper_bound)}</div>
+        </div>
+        <div class="metric">
+          <div class="k">已找到且满足限制的最高召回</div>
+          <div class="v">${bf && bf.metrics ? fmtPct(bf.metrics.recall) : "无"}</div>
+        </div>
+        <div class="metric">
+          <div class="k">无约束词表召回</div>
+          <div class="v">${fmtPct(f.unconstrained_max_recall)}</div>
+        </div>
+      </div>
       <p class="hint" style="margin-top:8px;">
-        无约束最高召回：<strong>${fmtPct(f.unconstrained_max_recall)}</strong> ｜
-        误检约束内最高召回：<strong>${fmtPct(f.best_feasible_recall)}</strong>
+        ${bf && bf.metrics
+          ? `本次搜索已找到且满足词项与误检限制的最佳组合：<code>${bf.expanded_terms.map(escapeHtml).join(", ") || "（仅基线）"}</code>
+             ｜ 召回 ${fmtPct(bf.metrics.recall)}，误检率 ${fmtPct(bf.metrics.fdr)}，
+             误检数 ${bf.metrics.false_positives}（未达到召回下限 ${fmtPct(data.thresholds.min_recall)}）`
+          : "没有满足词项与误检限制的组合。"}
         ${f.blocker_term
           ? `｜首个越界词：<code>${escapeHtml(f.blocker_term.term)}</code>`
           : ""}
+      </p>
+      <p class="hint">
+        上界计入：锁定词之后剩余的词位与仍可覆盖的正例，以及误检数随词项单调不减
+        对误检率的下界；若束宽或候选词池截断搜索，则退回全词表上界。
       </p>
       ${f.missing_relevant_docs.length
         ? `<p class="hint">无法覆盖的正例：${f.missing_relevant_docs.map((d) => escapeHtml(d.id)).join(", ")}</p>`

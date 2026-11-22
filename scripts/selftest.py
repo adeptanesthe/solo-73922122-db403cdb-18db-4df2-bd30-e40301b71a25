@@ -14,10 +14,18 @@ S4  Revision — exclude terms: solution is recomputed without them and the
     old suggestion id is rejected with HTTP 409.
 S5  Revision — lock a term: it is forced into every new solution.
 S6  Lock/exclude contradiction is rejected; unlock restores feasibility.
+S7  Intermediate fdr overflow is repaired (synthetic corpus): the only
+    full-recall combination passes through an over-limit partial state; it
+    must still be found, both free and with the polluting term locked.
+S8  Beam-width truncation: a narrow beam misses a solution a wide beam finds;
+    the failure must be reported as "inconclusive", never "impossible".
+S9  Proven infeasibility: an exhaustive search with no solution must be
+    reported as proven, with a safe recall upper bound and the best found.
 """
 
 from __future__ import annotations
 
+import itertools
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -27,6 +35,8 @@ sys.path.insert(0, str(ROOT))
 
 from fastapi.testclient import TestClient
 
+from app.engine import Corpus, AnalysisRequest
+from app.engine import analyze as engine_analyze
 from app.main import app
 
 CORPUS_PATH = ROOT / "data" / "demo_corpus.csv"
@@ -66,6 +76,44 @@ def analyze(sid: str, **overrides) -> dict:
     resp = client.post("/api/analyze", json=body)
     assert resp.status_code == 200, resp.text
     return resp.json()
+
+
+def _dilution_corpus() -> Corpus:
+    """Baseline 'alpha'; *every* first expansion term starts over the cap.
+
+    apoll alone / bpoll alone -> fdr 0.43 (> 0.35 cap), apoll+bpoll -> 0.33
+    with full recall.  The only viable combination therefore crosses an
+    over-limit intermediate state.
+    """
+    return Corpus.from_records([
+        {"id": "r1", "title": "t", "abstract": "alpha alpha", "relevant": True},
+        {"id": "r2", "title": "t", "abstract": "alpha alpha", "relevant": True},
+        {"id": "r3", "title": "t", "abstract": "apoll apoll", "relevant": True},
+        {"id": "r4", "title": "t", "abstract": "apoll apoll", "relevant": True},
+        {"id": "r5", "title": "t", "abstract": "bpoll bpoll", "relevant": True},
+        {"id": "r6", "title": "t", "abstract": "bpoll bpoll", "relevant": True},
+        {"id": "n1", "title": "t", "abstract": "apoll bpoll", "relevant": False},
+        {"id": "n2", "title": "t", "abstract": "apoll bpoll", "relevant": False},
+        {"id": "n3", "title": "t", "abstract": "apoll bpoll", "relevant": False},
+        {"id": "n4", "title": "t", "abstract": "filler filler", "relevant": False},
+        {"id": "n5", "title": "t", "abstract": "filler filler", "relevant": False},
+    ])
+
+
+def _beam_truncation_corpus() -> Corpus:
+    """beam_width=1 misses the winning pair; beam_width=8 finds it."""
+    records = [
+        ("d0", "t2 t5", True), ("d1", "t5 t0 alpha", True),
+        ("d2", "t5 t0", True), ("d3", "t1 t4 t3", True),
+        ("d4", "t1 t3", True), ("d5", "t3 t5 alpha", True),
+        ("d6", "t5 t1 t0 alpha", False), ("d7", "t2 t4", False),
+        ("d8", "t3 t5", False), ("d9", "t0 t4 t1", False),
+        ("d10", "t4 t5", False), ("d11", "t4 t5", False),
+    ]
+    return Corpus.from_records([
+        {"id": i, "title": "t", "abstract": a, "relevant": r}
+        for i, a, r in records
+    ])
 
 
 def main() -> int:
@@ -224,7 +272,113 @@ def main() -> int:
         payload={"conflict": conflict.json(), "unlock": unlock.json()},
     )
 
-    write_report(s1, s2, s2b, s3, s4, s5, s6, stale, failures)
+    # --------------------------------------------------------------- S7
+    # Intermediate fdr overflow that a later term repairs.  Ground truth is
+    # checked by brute force over all candidate combinations.
+    dil = _dilution_corpus()
+    brute_ok = []
+    for lock in ([], ["apoll"]):
+        cap = 0.35
+        base_docs = dil.docs_for_terms(dil.query_terms("alpha"))
+        lock_docs = dil.docs_for_terms(lock)
+        best = None
+        # exhaustive check over the small candidate vocabulary
+        all_cands = [t for t in dil.index_by_term
+                     if t not in dil.query_terms("alpha")]
+        for k in range(0, len(all_cands) + 1):
+            for combo in itertools.combinations(all_cands, k):
+                if any(t in lock for t in combo):
+                    continue
+                m = dil.metrics_for_docs(
+                    base_docs | lock_docs | dil.docs_for_terms(combo)
+                )
+                if m["recall"] >= 1.0 - 1e-12 and m["fdr"] <= cap + 1e-12:
+                    best = combo
+        req = AnalysisRequest(
+            query="alpha", min_recall=1.0, max_fdr=cap, locked_terms=lock,
+        )
+        res = engine_analyze(dil, req)
+        trace_fdr = {row["term"]: row["cumulative_fdr"] for row in res["trace"]}
+        # Verify the trace itself shows an over-limit step: the reported
+        # solution must be reachable only *through* an over-limit prefix.
+        over_limit_step = any(
+            row["cumulative_fdr"] > cap + 1e-12 for row in res["trace"]
+        )
+        ok = (
+            res["status"] == "satisfied"
+            and res["metrics"]["recall"] == 1.0
+            and res["metrics"]["fdr"] <= cap + 1e-12
+            and best is not None
+            and over_limit_step
+        )
+        brute_ok.append(ok)
+        failures += 0 if ok else 1
+        record(
+            f"S7{'' if not lock else 'b'} 中途误检超标后补足正例（"
+            f"{'锁定 apoll' if lock else '自由搜索'}）", ok,
+            f"锁定={lock}；真值组合={best}；扩展词={res['expanded_terms']}；"
+            f"召回={res['metrics']['recall']:.3f}；fdr={res['metrics']['fdr']:.3f}"
+            f"（上限 {cap:.0%}）；trace 中出现中途超标="
+            f"{any(row['cumulative_fdr'] > cap + 1e-12 for row in res['trace'])}"
+            f"（apoll 中途 fdr={trace_fdr.get('apoll', 'n/a')}）",
+            payload=res,
+        )
+
+    # --------------------------------------------------------------- S8
+    trunc = _beam_truncation_corpus()
+    narrow = engine_analyze(trunc, AnalysisRequest(
+        query="alpha", min_recall=0.8, max_fdr=0.3, max_terms=2, beam_width=1,
+    ))
+    wide = engine_analyze(trunc, AnalysisRequest(
+        query="alpha", min_recall=0.8, max_fdr=0.3, max_terms=2, beam_width=8,
+    ))
+    fd = narrow.get("failure") or {}
+    s8_ok = (
+        narrow["status"] == "failed"
+        and wide["status"] == "satisfied"
+        and fd.get("verdict") == "search_inconclusive"
+        and fd.get("proven_infeasible") is False
+        and fd.get("branches_pruned") is True
+        and fd.get("recall_upper_bound", 0) >= 0.8
+    )
+    failures += 0 if s8_ok else 1
+    record(
+        "S8 束宽截断 -> 尚无定论（而非证实无法达标）", s8_ok,
+        f"beam_width=1 状态={narrow['status']}，判定={fd.get('verdict')}，"
+        f"剪枝={fd.get('branches_pruned')}，召回上界={fd.get('recall_upper_bound')}；"
+        f"beam_width=8 状态={wide['status']}，扩展词={wide['expanded_terms']}，"
+        f"召回={wide['metrics']['recall']:.3f}",
+        payload={"narrow": narrow, "wide": wide},
+    )
+
+    # --------------------------------------------------------------- S9
+    # Demo corpus, full recall with a tiny fdr budget: the vocabulary ceiling
+    # makes this provably impossible; best-found must be reported separately.
+    s9 = analyze(sid, min_recall=1.0, max_fdr=0.05)
+    f9 = s9.get("failure") or {}
+    bf9 = s9.get("best_found")
+    s9_ok = (
+        s9["status"] == "failed"
+        and f9.get("verdict") == "proven_infeasible"
+        and f9.get("search_complete") is True
+        and f9.get("recall_upper_bound", 1) < 1.0
+        and bf9 is not None
+        and bf9["metrics"]["fdr"] <= 0.05 + 1e-12
+        and bf9["metrics"]["recall"] < 1.0
+    )
+    failures += 0 if s9_ok else 1
+    record(
+        "S9 穷尽搜索 -> 已证实无法达标 + 满足限制的最高召回", s9_ok,
+        f"判定={f9.get('verdict')}；搜索完成={f9.get('search_complete')}；"
+        f"召回上界={f9.get('recall_upper_bound')}；"
+        f"满足限制的最高召回={f9.get('best_feasible_recall')}（组合 "
+        f"{bf9['expanded_terms'] if bf9 else None}）；"
+        f"无约束词表召回={f9.get('unconstrained_max_recall')}",
+        payload=s9,
+    )
+
+    write_report(s1, s2, s2b, s3, s4, s5, s6, stale, failures,
+                 s7=(dil, brute_ok[0], brute_ok[1]), s8=(narrow, wide), s9=s9)
     print(f"\n{len(results) - failures}/{len(results)} scenarios passed.")
     return 1 if failures else 0
 
@@ -239,11 +393,12 @@ def _metrics_row(title: str, data: dict) -> str:
     )
 
 
-def write_report(s1, s2, s2b, s3, s4, s5, s6, stale, failures) -> None:
+def write_report(s1, s2, s2b, s3, s4, s5, s6, stale, failures,
+                 s7=None, s8=None, s9=None) -> None:
     REPORT_DIR.mkdir(exist_ok=True)
     path = REPORT_DIR / "selftest_report.md"
     lines: list[str] = []
-    lines.append("# 交付前自测报告（阈值冲突与修订场景）")
+    lines.append("# 交付前自测报告（阈值冲突、束宽与诊断场景）")
     lines.append("")
     lines.append(f"- 生成时间：{datetime.now().isoformat(timespec='seconds')}")
     lines.append("- 语料：`data/demo_corpus.csv`（45 篇，正例 17 / 负例 28；"
@@ -281,6 +436,57 @@ def write_report(s1, s2, s2b, s3, s4, s5, s6, stale, failures) -> None:
     for reason in s2b["failure"]["reasons"]:
         lines.append(f"- {reason}")
     lines.append("")
+    if s7 is not None:
+        dil, ok_free, ok_locked = s7
+        lines.append("## S7 中途误检超标后补足正例（逐词 trace，锁定 apoll）")
+        lines.append("")
+        lines.append("| 步骤 | 新增正例 | 新增负例 | 累计召回 | 累计fdr | 累计FP |")
+        lines.append("|---|---|---|---|---|---|")
+        # Re-run to capture the trace for the report (deterministic)
+        res_locked = engine_analyze(dil, AnalysisRequest(
+            query="alpha", min_recall=1.0, max_fdr=0.35,
+            locked_terms=["apoll"],
+        ))
+        for t in res_locked["trace"]:
+            lines.append(
+                f"| {t['term']} | {t['added_relevant']} | "
+                f"{t['added_nonrelevant']} | {t['cumulative_recall']:.3f} "
+                f"| {t['cumulative_fdr']:.3f} "
+                f"| {t['cumulative_false_positives']} |"
+            )
+        lines.append("")
+        lines.append(
+            "- 自由搜索（无锁定）真值校验：" + ("通过" if ok_free else "失败")
+        )
+        lines.append(
+            "- 锁定 apoll（锁定前缀即超标）真值校验："
+            + ("通过" if ok_locked else "失败")
+        )
+        lines.append("")
+    if s8 is not None:
+        narrow, wide = s8
+        lines.append("## S8 束宽截断的诊断原文")
+        lines.append("")
+        for reason in narrow["failure"]["reasons"]:
+            lines.append(f"- {reason}")
+        lines.append("")
+        lines.append(
+            f"- 同参数下 beam_width=8 的结果：扩展词 {wide['expanded_terms']}，"
+            f"召回 {wide['metrics']['recall']:.3f}，fdr {wide['metrics']['fdr']:.3f}"
+        )
+        lines.append("")
+    if s9 is not None:
+        lines.append("## S9 已证实无法达标时的诊断原文")
+        lines.append("")
+        for reason in s9["failure"]["reasons"]:
+            lines.append(f"- {reason}")
+        lines.append("")
+        lines.append(
+            f"- `verdict={s9['failure']['verdict']}`，"
+            f"`recall_upper_bound={s9['failure']['recall_upper_bound']}`，"
+            f"`best_feasible_recall={s9['failure']['best_feasible_recall']}`"
+        )
+        lines.append("")
     lines.append("## S1 逐词覆盖变化（trace 实测）")
     lines.append("")
     lines.append("| 步骤 | 新增正例 | 新增负例 | 累计召回 | 累计fdr | 累计FP |")

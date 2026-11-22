@@ -313,6 +313,30 @@ class SearchState:
     metrics: dict
 
 
+@dataclass
+class SearchOutcome:
+    """Everything the result layer needs from the constrained search.
+
+    ``best`` is the highest-recall state that meets *all* thresholds.  It may
+    stay ``None`` even when ``best_found`` exists: ``best_found`` is the
+    highest-recall state that satisfies the term rules and the false-detection
+    limits but possibly misses ``min_recall`` (used to report "how close we
+    got").
+    """
+
+    best: Optional[SearchState]
+    explored: list[SearchState]
+    lock_prefix: SearchState
+    lock_violation: Optional[str]
+    best_found: Optional[SearchState]
+    reachable_recall_ub: float
+    global_recall_ub: float
+    unconstrained_max_recall: float
+    search_complete: bool
+    branches_pruned: bool
+    pool_complete: bool
+
+
 def _within_limits(metrics: dict, max_fdr: float,
                    max_fp: Optional[int]) -> bool:
     if metrics["fdr"] > max_fdr + 1e-12:
@@ -320,6 +344,88 @@ def _within_limits(metrics: dict, max_fdr: float,
     if max_fp is not None and metrics["false_positives"] > max_fp:
         return False
     return True
+
+
+def _new_relevant_counts(
+    corpus: Corpus, covered: set[int], terms: Iterable[str]
+) -> list[int]:
+    """Per-term number of *not yet covered* relevant docs a term would add."""
+    counts: list[int] = []
+    for term in terms:
+        fresh = corpus.docs_for_terms([term]) - covered
+        counts.append(sum(1 for d in fresh if corpus.labels[d]))
+    return counts
+
+
+def _potential(
+    corpus: Corpus,
+    state: SearchState,
+    remaining_terms: list[str],
+    max_terms: int,
+    max_fdr: float,
+    max_fp: Optional[int],
+) -> tuple[float, float, bool]:
+    """Upper bound on reachable recall + lower bound on final fdr.
+
+    Both bounds are deliberately conservative and *safe*:
+
+    * false positives are monotone (adding terms only ORs documents in), so
+      the current false-positive count is a lower bound for every descendant;
+    * within the remaining term slots, each additional term can add at most
+      its full count of not-yet-covered relevant docs, so the sum over the
+      ``slots`` largest per-term counts bounds the union gain (capped by the
+      number of relevant docs still uncovered).
+
+    fdr = fp / (tp + fp) is increasing in fp and decreasing in tp, hence for
+    every descendant::
+
+        fdr_final >= fp_current / (tp_upper + fp_current)
+
+    Note that added *non-relevant* docs must **not** be put into the
+    denominator: they arrive together with their own false positives, and
+    ``x -> x / (tp + x)`` is increasing, so they can only raise the fdr.
+    ``fdr_lb`` is therefore a real lower bound on the fdr of every
+    descendant, and ``recall_ub`` a real upper bound on its recall.
+
+    A state is only discarded when *no* descendant can satisfy the limits —
+    a merely over-limit intermediate state is kept, because later terms that
+    add relevant docs without new false positives can dilute the fdr back
+    under the threshold.
+    """
+    slots = max(0, max_terms - len(state.terms))
+    rel_gains = sorted(
+        _new_relevant_counts(corpus, state.docs, remaining_terms), reverse=True
+    )
+    # Positive docs no remaining term can reach are unreachable forever;
+    # counting only still-coverable relevant docs keeps the bound tight.
+    coverable = corpus.docs_for_terms(remaining_terms) - state.docs
+    coverable_rel = sum(1 for d in coverable if corpus.labels[d])
+    add_tp = min(sum(rel_gains[:slots]), coverable_rel)
+
+    tp = state.metrics["true_positives"]
+    fp = state.metrics["false_positives"]
+    tp_upper = tp + add_tp
+    recall_ub = tp_upper / corpus.n_relevant if corpus.n_relevant else 0.0
+    fdr_lb = fp / (tp_upper + fp) if tp_upper + fp else 0.0
+    fp_possible = max_fp is None or fp <= max_fp
+    feasible_possible = fp_possible and fdr_lb <= max_fdr + 1e-12
+    return recall_ub, fdr_lb, feasible_possible
+
+
+def _solution_key(state: SearchState):
+    """Highest recall first, then shortest / cleanest suggestion.
+
+    Recall dominates because the caller asks for the highest recall reached
+    under the constraints; among equal-recall combinations fewer terms make
+    for a clearer explanation, then lower fdr and fewer false positives.
+    """
+    return (
+        -state.metrics["recall"],
+        len(state.terms),
+        state.metrics["fdr"],
+        state.metrics["false_positives"],
+        state.terms,
+    )
 
 
 def _beam_search(
@@ -332,72 +438,162 @@ def _beam_search(
     max_fp: Optional[int],
     beam_width: int,
     max_terms: int,
-) -> tuple[Optional[SearchState], list[SearchState], bool, Optional[str]]:
-    """Return (best satisfying state, all explored frontier states,
-    budget_exhausted, lock_violation_message)."""
+    baseline_terms: list[str],
+    excluded: set[str],
+) -> SearchOutcome:
+    """Beam search that keeps repairable intermediate violations alive.
+
+    The old implementation dropped any child that momentarily exceeded the
+    fdr / false-positive limits.  A combination can, however, exceed the
+    limit halfway and still satisfy it after more terms (typically relevant
+    additions dilute the fdr).  Such states now stay in the beam; only states
+    proven incapable of ever satisfying the limits (see ``_potential``) are
+    removed.
+    """
     initial = SearchState(terms=(), docs=set(baseline_docs),
                           metrics=corpus.metrics_for_docs(baseline_docs))
-    # Force locked terms first — they are non-negotiable user decisions.
+    # Locked terms are mandatory, but they are not allowed to abort the
+    # search: a polluting lock can be diluted by later terms as well.
+    lock_prefix = initial
     current = initial
     lock_violation: Optional[str] = None
     for term in locked:
         new_docs = current.docs | corpus.docs_for_terms([term])
         metrics = corpus.metrics_for_docs(new_docs)
         if not _within_limits(metrics, max_fdr, max_fp):
-            lock_violation = (
-                f"锁定词 {term!r} 单独加入后即突破误检上限"
-                f"（fdr={metrics['fdr']:.3f}, fp={metrics['false_positives']}）"
+            if lock_violation is None:
+                lock_violation = (
+                    f"锁定词 {term!r} 加入后误检指标一度超过上限"
+                    f"（fdr={metrics['fdr']:.3f}, fp={metrics['false_positives']}）"
+                )
+        else:
+            lock_prefix = SearchState(
+                terms=current.terms + (term,), docs=new_docs, metrics=metrics
             )
-            break
         current = SearchState(
             terms=current.terms + (term,), docs=new_docs, metrics=metrics
         )
-    if lock_violation:
-        return None, [current], False, lock_violation
+    base = current
 
-    if current.metrics["recall"] >= min_recall - 1e-12 and _within_limits(
-        current.metrics, max_fdr, max_fp
-    ):
-        return current, [current], False, None
+    # ---- global (unconstrained by the candidate-pool cap) upper bounds ---- #
+    eligible_all = [
+        term
+        for term, j in corpus.index_by_term.items()
+        if term not in set(baseline_terms)
+        and term not in excluded
+        and any(corpus.labels[d] for d in corpus.docs_by_term[j])
+    ]
+    ceiling_docs = base.docs | corpus.docs_for_terms(eligible_all)
+    ceiling = corpus.metrics_for_docs(ceiling_docs)
+    unconstrained_max_recall = ceiling["recall"]
 
+    # A term that adds a false positive but no *new* relevant doc can only
+    # make every metric worse — no feasible solution can contain it (feasible
+    # sets are downward closed on harmless-to-drop terms).  Excluding these
+    # keeps the recall bound tight without ever making it unsafe.
+    def is_productive(term: str) -> bool:
+        fresh = corpus.docs_for_terms([term]) - base.docs
+        add_tp = sum(1 for d in fresh if corpus.labels[d])
+        add_fp = len(fresh) - add_tp
+        return not (add_tp == 0 and add_fp > 0)
+
+    useful_terms = [t for t in eligible_all if is_productive(t)]
+    slots_for_base = max(0, max_terms - len(locked))
+    # Only relevant docs reachable by the remaining useful terms can ever be
+    # covered; positive docs absent from the whole vocabulary are not.
+    still_coverable = corpus.docs_for_terms(useful_terms) - base.docs
+    coverable_rel = sum(1 for d in still_coverable if corpus.labels[d])
+    global_gain = min(
+        sum(
+            sorted(
+                _new_relevant_counts(corpus, base.docs, useful_terms), reverse=True
+            )[:slots_for_base]
+        ),
+        coverable_rel,
+    )
+    global_recall_ub = (
+        (base.metrics["true_positives"] + max(0, global_gain)) / corpus.n_relevant
+        if corpus.n_relevant
+        else 0.0
+    )
+
+    # A candidate pool truncated to max_candidates means the search cannot be
+    # called exhaustive w.r.t. the whole vocabulary.
     candidate_terms = [c.term for c in candidates if c.term not in locked]
-    frontier = [current]
-    explored: list[SearchState] = [current]
+    pool_complete = set(eligible_all) <= (set(candidate_terms) | set(locked))
+
+    def consider(state: SearchState) -> None:
+        nonlocal best, best_found
+        if not _within_limits(state.metrics, max_fdr, max_fp):
+            return
+        if best_found is None or _solution_key(state) < _solution_key(best_found):
+            best_found = state
+        if state.metrics["recall"] >= min_recall - 1e-12:
+            if best is None or _solution_key(state) < _solution_key(best):
+                best = state
+
     best: Optional[SearchState] = None
-    budget_exhausted = False
+    best_found: Optional[SearchState] = None
+    consider(base)
+    if best is not None:
+        # Baseline query already meets the thresholds: no expansion needed.
+        return SearchOutcome(
+            best=best,
+            explored=[base],
+            lock_prefix=lock_prefix,
+            lock_violation=lock_violation,
+            best_found=best_found,
+            reachable_recall_ub=min(global_recall_ub, base.metrics["recall"]),
+            global_recall_ub=global_recall_ub,
+            unconstrained_max_recall=unconstrained_max_recall,
+            search_complete=False,
+            branches_pruned=False,
+            pool_complete=pool_complete,
+        )
+
+    frontier = [base]
+    explored: list[SearchState] = [base]
+    base_ub = _potential(
+        corpus, base, candidate_terms, max_terms, max_fdr, max_fp
+    )[0]
+    state_bounds: list[float] = [base_ub]
+    branches_pruned = False
 
     for _depth in range(max_terms - len(locked)):
         children: list[SearchState] = []
         for state in frontier:
+            slots_left = max_terms - len(state.terms)
+            if slots_left <= 0:
+                continue
             existing = set(state.terms)
-            for term in candidate_terms:
-                if term in existing:
-                    continue
+            remaining = [t for t in candidate_terms if t not in existing]
+            for term in remaining:
                 new_docs = state.docs | corpus.docs_for_terms([term])
                 metrics = corpus.metrics_for_docs(new_docs)
-                if not _within_limits(metrics, max_fdr, max_fp):
-                    continue
                 child = SearchState(
                     terms=state.terms + (term,), docs=new_docs, metrics=metrics
                 )
-                children.append(child)
                 explored.append(child)
-                if metrics["recall"] >= min_recall - 1e-12:
-                    if best is None or (
-                        child.metrics["fdr"],
-                        child.metrics["false_positives"],
-                        len(child.terms),
-                    ) < (
-                        best.metrics["fdr"],
-                        best.metrics["false_positives"],
-                        len(best.terms),
-                    ):
-                        best = child
-        if best is not None:
-            return best, explored, False, None
+                consider(child)
+                remaining_after = [t for t in remaining if t != term]
+                recall_ub, _fdr_lb, possible = _potential(
+                    corpus, child, remaining_after, max_terms, max_fdr, max_fp
+                )
+                if not possible:
+                    continue  # provably no feasible descendant
+                state_bounds.append(recall_ub)
+                if recall_ub < min_recall - 1e-12:
+                    # Feasible states are still recorded above, but no
+                    # descendant can reach the recall threshold.
+                    continue
+                children.append(child)
+
         if not children:
             break
-        # beam pruning: prefer high recall, then low fdr, then fewest terms
+
+        # Deduplicate by term set (different orders give the same coverage).
+        # Rank by *current* coverage — a state already over the fdr limit is
+        # kept in the beam because a later relevant-only term can dilute it.
         children.sort(
             key=lambda s: (
                 -s.metrics["recall"],
@@ -406,7 +602,6 @@ def _beam_search(
                 len(s.terms),
             )
         )
-        # dedupe by term set
         deduped: list[SearchState] = []
         seen_sets: set[frozenset] = set()
         for s in children:
@@ -414,18 +609,36 @@ def _beam_search(
             if key not in seen_sets:
                 seen_sets.add(key)
                 deduped.append(s)
-        frontier = deduped[:beam_width]
-        # Pruning is only relevant to the failure when some pruned branch
-        # reached a strictly better recall than every kept branch; otherwise
-        # the cap is set by the data, not the beam width.
         if len(deduped) > beam_width:
-            kept_best_recall = deduped[0].metrics["recall"]
-            pruned_best_recall = max(
-                s.metrics["recall"] for s in deduped[beam_width:]
-            )
-            if pruned_best_recall > kept_best_recall + 1e-12:
-                budget_exhausted = True
-    return best, explored, budget_exhausted, None
+            branches_pruned = True
+        frontier = deduped[:beam_width]
+
+    search_bound = max(state_bounds) if state_bounds else 0.0
+    complete = (not branches_pruned) and pool_complete
+    if complete:
+        # Nothing was pruned: the best state found under the false-detection
+        # limits is provably the maximum, so the bound is exact (not loose).
+        reachable_ub = (
+            best_found.metrics["recall"] if best_found is not None
+            else base.metrics["recall"]
+        )
+    else:
+        # Unsearched branches exist; fall back to the safe bound that only
+        # counts remaining term slots and still-coverable relevant docs.
+        reachable_ub = min(search_bound, global_recall_ub)
+    return SearchOutcome(
+        best=best,
+        explored=explored,
+        lock_prefix=lock_prefix,
+        lock_violation=lock_violation,
+        best_found=best_found,
+        reachable_recall_ub=reachable_ub,
+        global_recall_ub=global_recall_ub,
+        unconstrained_max_recall=unconstrained_max_recall,
+        search_complete=complete,
+        branches_pruned=branches_pruned,
+        pool_complete=pool_complete,
+    )
 
 
 def _diagnose_failure(
@@ -436,45 +649,59 @@ def _diagnose_failure(
     min_recall: float,
     max_fdr: float,
     max_fp: Optional[int],
-    explored: list[SearchState],
-    budget_exhausted: bool,
-    lock_violation: Optional[str] = None,
+    outcome: SearchOutcome,
+    baseline_terms: list[str],
+    excluded: set[str],
 ) -> dict:
-    """Explain *why* the thresholds could not be met."""
-    # 1. Unconstrained best: add every candidate + locked term and see the
-    #    maximum recall reachable without any false-detection limit.
-    all_terms = [c.term for c in candidates] + [
-        t for t in locked if t not in {c.term for c in candidates}
-    ]
-    ceiling_docs = baseline_docs | corpus.docs_for_terms(all_terms)
-    ceiling = corpus.metrics_for_docs(ceiling_docs)
+    """Explain *why* the thresholds could not be met.
 
-    # 2. For the unconstrained ceiling, which relevant docs remain missing?
+    The verdict is two-valued on purpose:
+
+    * ``proven_infeasible`` — a complete search (no beam pruning and the
+      full eligible vocabulary in the pool) found nothing, *or* the safe
+      recall upper bound is below the threshold.  Either way no combination
+      can satisfy the thresholds.
+    * ``search_inconclusive`` — the beam width truncated the search while the
+      safe upper bound is still at/above the threshold.  The search found no
+      solution, but one may still exist, so the user is told to widen the
+      beam rather than being told the target is impossible.
+    """
+    # 1. Unconstrained ceiling over the *full* eligible vocabulary (not just
+    #    the truncated pool), so the reported bound is trustworthy.  The
+    #    "missing relevant" list refers to the same universe, which is why
+    #    excluded terms do not count as coverable.
+    eligible_all = [
+        term
+        for term, j in corpus.index_by_term.items()
+        if term not in set(baseline_terms)
+        and term not in excluded
+        and any(corpus.labels[d] for d in corpus.docs_by_term[j])
+    ]
+    all_terms = list(dict.fromkeys(eligible_all + locked))
+    ceiling_docs = baseline_docs | corpus.docs_for_terms(all_terms)
     relevant_idx = [i for i, lab in enumerate(corpus.labels) if lab]
     missing_relevant = [i for i in relevant_idx if i not in ceiling_docs]
 
-    # 3. Best recall achievable *within* the fdr / fp limits.
-    within = [
-        s.metrics["recall"]
-        for s in explored
-        if _within_limits(s.metrics, max_fdr, max_fp)
-    ]
-    best_feasible_recall = max(within) if within else 0.0
+    # 2. Highest recall actually observed within the false-detection limits
+    #    (the terms may not reach min_recall, but they respect the caps).
+    #    ``best_found`` is the best such state the search discovered.
+    best_feasible_recall = (
+        outcome.best_found.metrics["recall"] if outcome.best_found else 0.0
+    )
+    best_found_available = outcome.best_found is not None
 
-    # 4. Find the cheapest terms (in fdr cost) that would lift recall.
-    #    Report the first term whose addition pushes past the limit.
+    # 3. First term that would breach the limit from the lock-prefix state —
+    #    only meaningful when that starting point is itself within the limits.
     blocker: Optional[dict] = None
-    current_docs = set(baseline_docs) | corpus.docs_for_terms(locked)
+    current_docs = set(outcome.lock_prefix.docs)
     remaining = [c for c in candidates if c.term not in locked]
-    # Deterministic ordering: fewest non-relevant hits first (absolute
-    # pollution), then most relevant hits, then lexicographic term name.
+    if not _within_limits(
+        outcome.lock_prefix.metrics, max_fdr, max_fp
+    ):
+        remaining = []
     remaining_sorted = sorted(
         remaining,
-        key=lambda c: (
-            c.n_nonrelevant_hits,
-            -c.n_relevant_hits,
-            c.term,
-        ),
+        key=lambda c: (c.n_nonrelevant_hits, -c.n_relevant_hits, c.term),
     )
     for cand in remaining_sorted:
         trial_docs = current_docs | corpus.docs_for_terms([cand.term])
@@ -483,13 +710,11 @@ def _diagnose_failure(
             blocker = {
                 "term": cand.term,
                 "would_add_relevant": sum(
-                    1
-                    for d in corpus.docs_for_terms([cand.term])
+                    1 for d in corpus.docs_for_terms([cand.term])
                     if corpus.labels[d] and d not in current_docs
                 ),
                 "would_add_nonrelevant": sum(
-                    1
-                    for d in corpus.docs_for_terms([cand.term])
+                    1 for d in corpus.docs_for_terms([cand.term])
                     if not corpus.labels[d] and d not in current_docs
                 ),
                 "resulting_fdr": round(trial["fdr"], 4),
@@ -498,13 +723,49 @@ def _diagnose_failure(
             break
         current_docs = trial_docs
 
+    # 4. Verdict + reasons.  A complete search (no beam pruning and the full
+    # eligible vocabulary in the pool) enumerated every candidate combination,
+    # so finding nothing is a proof of infeasibility.  The vocabulary-wide
+    # bound (which ignores the pool cap) is also a proof when it falls below
+    # the target.  Otherwise a truncated search is only conclusive when the
+    # safe bound over the searched space is below the target.
+    recall_ub = outcome.reachable_recall_ub
+    if outcome.global_recall_ub + 1e-12 < min_recall:
+        proven_infeasible = True
+    elif outcome.search_complete:
+        proven_infeasible = True
+    elif not outcome.pool_complete:
+        # The pool cap hides part of the vocabulary; the full-vocabulary
+        # bound is still at/above the target, so a solution may exist.
+        proven_infeasible = False
+    else:
+        proven_infeasible = recall_ub + 1e-12 < min_recall
+
     reasons: list[str] = []
-    if lock_violation:
-        reasons.append(lock_violation + "。请解除该锁定词或放宽误检上限。")
-    if ceiling["recall"] + 1e-12 < min_recall:
+    if outcome.lock_violation:
         reasons.append(
-            f"词表覆盖上限不足：即使加入全部 {len(all_terms)} 个候选词，"
-            f"最高召回也只有 {ceiling['recall']:.1%}，"
+            outcome.lock_violation
+            + "。锁定词仍会参与搜索，但若最终无法补足正例稀释误检，"
+              "可解除该锁定词或放宽误检上限。"
+        )
+    if not proven_infeasible:
+        # Not a proof: report the best found under the term / false-detection
+        # rules and the safe upper bound, and say the search is undecided.
+        found = (
+            "没有满足词项与误检限制的组合"
+            if not best_found_available
+            else f"已找到且满足限制的最高召回为 {best_feasible_recall:.1%}"
+        )
+        reasons.append(
+            f"在召回下限 {min_recall:.1%} 与误检上限 fdr<={max_fdr:.1%}"
+            + (f" 且误检数<={max_fp}" if max_fp is not None else "")
+            + f" 下本次搜索未找到达标组合；{found}，"
+            f"最高可达召回的可靠上界为 {recall_ub:.1%}。"
+        )
+    elif outcome.global_recall_ub + 1e-12 < min_recall:
+        reasons.append(
+            f"词表覆盖上限不足：即使加入全部 {len(eligible_all)} 个可用候选词，"
+            f"最高召回也只有 {outcome.unconstrained_max_recall:.1%}，"
             f"低于召回下限 {min_recall:.1%}。"
         )
         if missing_relevant:
@@ -515,12 +776,20 @@ def _diagnose_failure(
                   "建议补充语料或放宽词频限制。"
             )
     else:
+        found = (
+            "没有满足词项与误检限制的组合"
+            if not best_found_available
+            else f"已找到且满足限制的最高召回为 {best_feasible_recall:.1%}"
+        )
         reasons.append(
-            f"召回目标理论上可达（无约束最高召回 {ceiling['recall']:.1%}），"
-            f"但在误检上限 fdr<={max_fdr:.1%}"
+            f"在召回下限 {min_recall:.1%} 与误检上限 fdr<={max_fdr:.1%}"
             + (f" 且误检数<={max_fp}" if max_fp is not None else "")
-            + f" 下最高只能达到召回 {best_feasible_recall:.1%}，"
-              "提升召回所需的词都会引入过多负例。"
+            + f" 下未找到达标组合；{found}，"
+            + (
+                "搜索已穷尽。"
+                if outcome.search_complete
+                else f"最高可达召回的可靠上界为 {recall_ub:.1%}。"
+            )
         )
     if blocker:
         reasons.append(
@@ -535,19 +804,45 @@ def _diagnose_failure(
             )
             + "。可适当上调误检上限后重试。"
         )
-    if budget_exhausted and best_feasible_recall + 1e-12 < min_recall:
+    if outcome.branches_pruned:
         reasons.append(
-            "候选组合数超过束宽（beam_width）已被剪枝，可增大 beam_width 再试。"
+            "搜索过程中候选组合数超过束宽（beam_width）被剪枝，"
+            "本次结果不构成「无法达标」的证明；可增大 beam_width 再试。"
+        )
+    if not outcome.pool_complete:
+        reasons.append(
+            "候选词池已达到 max_candidates 上限，搜索未覆盖全部可用词；"
+            "可提高候选词上限后再试。"
+        )
+    if proven_infeasible:
+        reasons.append(
+            f"结论：已证实不存在满足词项与误检限制且达到召回 {min_recall:.1%} "
+            f"的组合（最高可达召回上界 {recall_ub:.1%}）。"
+        )
+    else:
+        reasons.append(
+            f"结论：搜索尚无定论——最高可达召回上界 {recall_ub:.1%} 表明"
+            "仍可能有达标组合，请增大 beam_width 或候选词上限后重试。"
         )
 
     return {
-        "unconstrained_max_recall": round(ceiling["recall"], 4),
+        "verdict": (
+            "proven_infeasible" if proven_infeasible else "search_inconclusive"
+        ),
+        "proven_infeasible": proven_infeasible,
+        "search_complete": outcome.search_complete,
+        "branches_pruned": outcome.branches_pruned,
+        "candidate_pool_complete": outcome.pool_complete,
+        "unconstrained_max_recall": round(outcome.unconstrained_max_recall, 4),
+        "recall_upper_bound": round(recall_ub, 4),
+        "global_recall_upper_bound": round(outcome.global_recall_ub, 4),
         "best_feasible_recall": round(best_feasible_recall, 4),
         "missing_relevant_docs": [
             {"id": corpus.doc_ids[i], "title": corpus.titles[i]}
             for i in missing_relevant[:10]
         ],
         "blocker_term": blocker,
+        "lock_violation": outcome.lock_violation,
         "reasons": reasons,
     }
 
@@ -697,11 +992,12 @@ def analyze(corpus: Corpus, req: AnalysisRequest) -> dict:
             ))
     all_candidates = candidates + extra_locked
 
-    best, explored, budget_exhausted, lock_violation = _beam_search(
+    outcome = _beam_search(
         corpus, candidates + extra_locked, locked, baseline_docs,
         req.min_recall, req.max_fdr, req.max_false_positives,
-        req.beam_width, req.max_terms,
+        req.beam_width, req.max_terms, baseline_terms, excluded,
     )
+    best = outcome.best
 
     common = {
         "corpus_size": len(corpus.labels),
@@ -736,18 +1032,30 @@ def analyze(corpus: Corpus, req: AnalysisRequest) -> dict:
         diagnosis = _diagnose_failure(
             corpus, candidates + extra_locked, locked, baseline_docs,
             req.min_recall, req.max_fdr, req.max_false_positives,
-            explored, budget_exhausted, lock_violation,
+            outcome, baseline_terms, excluded,
         )
-        diagnosis["lock_violation"] = lock_violation
-        # Best-effort fallback: only locked terms that were actually applied
-        # before a violation (or all locked terms when the failure happened
-        # later in the search).
-        fallback_terms = list(explored[0].terms) if explored else []
+        # Best-effort output: prefer the highest-recall state that still
+        # satisfies the false-detection limits (even if it misses min_recall);
+        # otherwise fall back to the applied lock prefix.
+        fallback = outcome.best_found or outcome.lock_prefix
+        fallback_terms = list(fallback.terms)
         fallback_docs = baseline_docs | corpus.docs_for_terms(fallback_terms)
         return {
             **common,
             "status": Status.FAILED.value,
             "failure": diagnosis,
+            "best_found": (
+                None
+                if outcome.best_found is None
+                else {
+                    "selected_terms": list(outcome.best_found.terms),
+                    "expanded_terms": [
+                        t for t in outcome.best_found.terms
+                        if t not in baseline_terms
+                    ],
+                    "metrics": outcome.best_found.metrics,
+                }
+            ),
             "selected_terms": fallback_terms,
             "expanded_terms": [t for t in fallback_terms if t not in baseline_terms],
             "trace": _build_trace(corpus, baseline_terms, fallback_terms),
@@ -764,6 +1072,11 @@ def analyze(corpus: Corpus, req: AnalysisRequest) -> dict:
         **common,
         "status": Status.SATISFIED.value,
         "failure": None,
+        "best_found": {
+            "selected_terms": selected,
+            "expanded_terms": expanded_terms,
+            "metrics": corpus.metrics_for_docs(final_docs),
+        },
         "selected_terms": selected,
         "expanded_terms": expanded_terms,
         "trace": _build_trace(corpus, baseline_terms, selected),
