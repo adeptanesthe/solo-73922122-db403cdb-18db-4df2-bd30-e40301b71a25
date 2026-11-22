@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>科研检索查询扩展系统</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <header>
+    <h1>科研检索查询扩展系统</h1>
+    <p class="subtitle">
+      上传带相关性标签的论文摘要 → 输入查询与阈值 → 系统从正例候选词中选择扩展项，
+      重排结果并逐词解释覆盖变化
+    </p>
+  </header>
+
+  <main>
+    <!-- 1. 语料上传 -->
+    <section class="card" id="upload-card">
+      <h2>① 语料上传</h2>
+      <div class="row">
+        <input type="file" id="file-input" accept=".csv,.tsv,.json,.jsonl" />
+        <button id="upload-btn">上传语料</button>
+        <button id="demo-btn" class="secondary">使用内置演示语料</button>
+      </div>
+      <p class="hint">
+        支持 CSV / TSV（表头含 id,title,abstract,relevant）或 JSON / JSONL 数组；
+        relevant 取 true/false、1/0、yes/no。
+      </p>
+      <div id="upload-status" class="status"></div>
+    </section>
+
+    <!-- 2. 查询与阈值 -->
+    <section class="card hidden" id="query-card">
+      <h2>② 查询与阈值</h2>
+      <label>初始查询
+        <input type="text" id="query-input" value="quantum error correction" />
+      </label>
+      <div class="grid3">
+        <label>召回下限 min_recall
+          <input type="number" id="min-recall" min="0" max="1" step="0.05" value="0.85" />
+        </label>
+        <label>误检率上限 max_fdr
+          <input type="number" id="max-fdr" min="0" max="1" step="0.05" value="0.2" />
+        </label>
+        <label>误检数量上限 max_fp（可选）
+          <input type="number" id="max-fp" min="0" step="1" placeholder="留空 = 不限制" />
+        </label>
+      </div>
+      <div class="grid3">
+        <label>束宽 beam_width
+          <input type="number" id="beam-width" min="1" max="64" value="8" />
+        </label>
+        <label>最多扩展词 max_terms
+          <input type="number" id="max-terms" min="1" max="30" value="12" />
+        </label>
+        <label>返回文档数 top_k
+          <input type="number" id="top-k" min="1" max="500" value="50" />
+        </label>
+      </div>
+      <div class="row">
+        <button id="analyze-btn">运行扩展分析</button>
+        <span id="revision-badge" class="badge hidden"></span>
+      </div>
+      <div id="query-error" class="error hidden"></div>
+    </section>
+
+    <!-- 3. 词锁定/排除面板 -->
+    <section class="card hidden" id="terms-card">
+      <h2>③ 候选词与人工修订（锁定 / 排除）</h2>
+      <p class="hint">
+        锁定词强制保留在扩展集合中；排除词永不参与。任何修改都会使修订号 +1、
+        旧建议立即失效，需重新分析。
+      </p>
+      <div class="chips" id="locked-chips"></div>
+      <div class="chips" id="excluded-chips"></div>
+      <table id="candidate-table">
+        <thead>
+          <tr>
+            <th>候选词</th><th>正例命中</th><th>负例命中</th><th>评分</th>
+            <th>说明</th><th>操作</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </section>
+
+    <!-- 4. 分析结果 -->
+    <section class="card hidden" id="result-card">
+      <h2>④ 分析结果</h2>
+      <div id="result-summary"></div>
+
+      <h3>每个扩展词带来的覆盖变化</h3>
+      <table id="trace-table">
+        <thead>
+          <tr>
+            <th>词 / 步骤</th><th>新增正例</th><th>新增负例</th>
+            <th>累计命中文档</th><th>累计召回</th><th>累计误检率</th>
+            <th>累计误检数</th><th>说明</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+
+      <div id="failure-box" class="failure hidden"></div>
+
+      <h3>重排后的检索结果 <span class="hint" id="ranking-meta"></span></h3>
+      <table id="ranking-table">
+        <thead>
+          <tr><th>#</th><th>ID</th><th>标题</th><th>标签</th><th>命中词</th><th>相似度</th></tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </section>
+  </main>
+
+  <footer>
+    FastAPI + scikit-learn + 原生 HTML/JS ·
+    布尔 OR 覆盖模型 + TF-IDF 余弦重排 · 束搜索约束求解
+  </footer>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

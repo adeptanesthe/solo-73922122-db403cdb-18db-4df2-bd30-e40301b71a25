@@ -1,0 +1,46 @@
+id,title,abstract,relevant
+P039,Interference based silencing (CRISPR),CRISPR interference silences promoters without altering the DNA sequence.,false
+P001,Thresholds of fault tolerant encoding (QEC),Quantum error correction protects fragile quantum states against noise.,true
+P006,Measurement interleaved protection schemes (QEC),This quantum error correction scheme interleaves gates with measurement.,true
+P022,Attention versus kernels (ML),Attention based neural models outperform kernel methods on benchmark datasets.,false
+P014,Rotated layout optimization (QEC),A rotated surface code layout reduces physical qubit overhead per logical qubit.,true
+P036,Cancer dependency screens (CRISPR),We apply CRISPR screening to identify cancer dependency genes.,false
+P031,Real time neural control (ML),The neural decoder runs on a control stack for real time statistical inference.,false
+P019,Attention graph models (ML),A deep neural network combines attention with graph convolution layers.,false
+P018,Molecular representation learning (ML),Graph neural network models learn molecular representations for drug discovery.,false
+P045,Reduced order warming emulator (CLIMATE),A reduced order climate emulator reproduces century scale warming trajectories.,false
+P038,Delivery for therapeutics (CRISPR),Delivery vectors limit CRISPR therapeutic adoption in clinical settings.,false
+P015,Code distance limits in near term devices (QEC),Decoherence limits the achievable code distance of near term processors.,true
+P007,Surface code demonstration on a qubit array (QEC),A surface code implementation suppresses errors on a logical qubit array.,true
+P030,Tensor inspired layers (ML),Tensor network inspired layers broaden the neural architecture search space.,false
+P020,Architecture search at scale (ML),Neural architecture search reduces training cost of large network models.,false
+P029,Parameterized circuits reviewed (ML),Graph networks emulate surface code decoding under syndrome noise statistics.,false
+P027,Pretraining on small graphs (ML),Self supervised pretraining improves neural generalization on small graphs.,false
+P005,Overhead analysis for encoded processors (QEC),Encoded quantum error correction circuits reduce logical error rates.,true
+P035,Guide design for human cells (CRISPR),Guide RNA design tools improve CRISPR Cas9 specificity in human cells.,false
+P034,Precision base editing (CRISPR),Base editing extends CRISPR precision without double strand DNA breaks.,false
+P043,Cloud feedback uncertainty (CLIMATE),Cloud feedbacks remain the largest source of climate model uncertainty.,false
+P026,Baselines for chemical data (ML),We compare neural baselines against random forests on chemical datasets.,false
+P024,Transfer learning workflows (ML),Transfer learning warms up the network before full neural fine tuning.,false
+P023,Hybrid graph decoders (ML),A hybrid neural decoder compresses graph features for downstream classification.,false
+P009,Efficient decoding of stabilizer events (QEC),Syndrome decoding identifies bit flip and phase flip events efficiently.,true
+P017,Fluxonium parity pulse engineering (QEC),Fluxonium parity-selective tunneling proceeds without ancilla feedback atop a tantalum wafer.,true
+P013,Correlated noise in stabilizer data (QEC),Syndrome statistics reveal correlated decoherence channels in the device.,true
+P010,Real time stabilizer extraction (QEC),Real time syndrome extraction enables fault tolerant stabilizer rounds.,true
+P012,Logical lifetime benchmarking (QEC),We benchmark logical qubit lifetime after surface code stabilizer cycles.,true
+P021,Protein binding prediction (ML),We train a graph network on protein structures to predict binding affinity.,false
+P008,Lattice surgery for encoded qubits (QEC),The surface code lattice maps each logical qubit onto physical qubits.,true
+P044,Satellite constrained aerosols (CLIMATE),Satellite observations constrain climate model parameterization of aerosols.,false
+P032,Cas9 specificity analysis (CRISPR),CRISPR Cas9 gene editing modifies target loci with guide RNA specificity.,false
+P028,Quantum inspired learning (ML),A neural syndrome classifier processes surface code measurement streams for inference.,false
+P011,Coherence preservation via stabilizers (QEC),Decoherence mitigation via repeated stabilizer measurement extends coherence time.,true
+P002,Stabilizer circuits on superconducting hardware (QEC),Fault tolerant quantum error correction requires repeated syndrome checks.,true
+P042,Downscaled flood risk (CLIMATE),We downscale climate projections for coastal flood risk assessment.,false
+P004,Encoded circuit benchmarking (QEC),Quantum error correction overhead is estimated for superconducting qubits.,true
+P003,Logical error rate estimation (QEC),We analyze quantum error correction thresholds under depolarizing noise.,true
+P040,Sea temperature projections (CLIMATE),Climate models project sea surface temperature trends under emission scenarios.,false
+P025,Neighbor feature aggregation (ML),Graph convolution layers aggregate neighbor features inside the network.,false
+P041,Ensemble uncertainty quantification (CLIMATE),Ensemble climate simulations quantify uncertainty in regional rainfall patterns.,false
+P016,Bosonic mode stabilization (QEC),Bosonic cat-cat poisoning mitigates transmon dephasing via Kerr-driven pumping within niobium resonators.,true
+P033,Off target sequencing study (CRISPR),Off target effects of CRISPR editing are measured by deep sequencing.,false
+P037,Prime editing workflow (CRISPR),Prime editing combines reverse transcription with CRISPR nickase activity.,false
